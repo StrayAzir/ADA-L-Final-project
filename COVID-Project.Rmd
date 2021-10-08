@@ -1,0 +1,275 @@
+---
+title: "FianlProject"
+author: "Rui Li"
+date: "12/8/2020"
+output: html_document
+---
+##read
+```{r}
+pacman::p_load(mlr, survival, survminer, tidyverse, readxl, lmtest, table1, nnet)
+library(arsenal)
+EDS=read_excel('COVID-19summary.xlsx')
+```
+
+##Modification: LOS is not in the same format
+```{r}
+## change LOS (?d?h) to total hour.
+#label data with "day"
+EDS = EDS %>%
+  mutate(label = ifelse(str_detect(LOS, "d"), 1, 0))
+#delete 'd' and 'h'
+EDS.1 = EDS %>%
+  mutate(LOS = str_remove(LOS, "h")) %>%
+  filter(label==1) %>%
+  separate(LOS, into = c("day","hour"), sep= "d", remove = F) %>%
+  mutate(hour = as.numeric(hour),
+          day = as.numeric(day)) %>%
+  mutate(hour = ifelse(is.na(hour),0, hour)) %>%
+  mutate(hour_total=day*24 + hour) %>%
+  select(-day, -hour)
+  
+
+EDS.0 = EDS %>%
+  filter(label==0) %>%
+  mutate(hour_total = as.numeric(str_remove(LOS, "h")))
+
+#merge
+COVID = rbind(EDS.1,EDS.0)
+              
+```
+
+##Data management
+```{r}
+COVID = COVID %>%
+##Recode Age variable as a factor variable and label it
+  mutate(Age = as.numeric(Age),
+         Age_f=case_when(Age < 60 ~ "0",
+                         Age >= 60  ~ "1"),
+##Recode LOS variable as a factor variable
+         ER_retention=case_when(hour_total < 2 ~ "0",
+                                hour_total >=2 ~ "1"))
+##delete the missing value (optional)
+    ##filter(is.na()==FALSE) %>%
+COVID = COVID %>% 
+  na.omit()
+```
+
+```{r}
+print(head(COVID, 10))
+```
+
+##table 1
+```{r}
+COVID.T = COVID %>%
+##Recode Age variable as a factor variable and label it
+  mutate(Age = as.numeric(Age),
+         Age_f = case_when(Age < 60 ~ "No Elderly",
+                         Age >= 60  ~ "Elderly"),
+##Recode LOS variable as a factor variable
+         ER_retention = case_when(hour_total < 2 ~ "No Retention",
+                                hour_total >=2 ~ "Retention"),
+          Gender = case_when(Sex == 1 ~ "Male",
+                          Sex == 0 ~ "Female"),
+          EPI = case_when(EPI == 0 ~ "Pre-pandemic",
+                          EPI == 1 ~ "Pandemic"))
+
+label(COVID.T$Age_f) = "Elderly"
+label(COVID.T$System) = "System of human body"
+label(COVID.T$ER_retention) = "Emergency room retention"
+table1(~ Age_f + Gender + System + Outcome + ER_retention|EPI, COVID.T)
+```
+
+## Multivariate linear regression: LOS ~ Age + Sex + System
+```{r}
+COVID = COVID %>%
+  mutate(System = as.factor(System) )
+
+mod.mlr = lm( hour_total ~ EPI + Age + Sex + System, data= COVID)
+summary (mod.mlr)
+
+confint(mod.mlr, level = 0.95)
+## Interpretation: After adjusting for covariates, the mean LOS of patients during COVID-19 increased 13.5 h compared to pre-pandemic.
+```
+
+##Logistic regrssion -- retention
+```{r}
+#logistic model
+COVID$ER_retention = as.numeric(COVID$ER_retention)
+Logit <- glm(ER_retention ~ EPI, data=COVID, family="binomial")
+summary(Logit)
+
+#calculate and print ORs and 95% CIs  
+OR<-exp(cbind(OR = coef(Logit), confint(Logit)))
+OR
+#Interpretation: the odds of retention is 5.7 times higher (95% CI 4.4-7.4)in patients admitted during the COVID-19 pandemic compared to pre-pandemic.
+```
+```{r}
+#logistic model -adjusted
+COVID$ER_retention = as.numeric(COVID$ER_retention)
+Logit.a <- glm(ER_retention ~ EPI+ Age + Sex + System, data=COVID, family="binomial")
+summary(Logit.a)
+
+#calculate and print ORs and 95% CIs  
+OR<-exp(cbind(OR = coef(Logit.a), confint(Logit.a)))
+OR
+#Interpretation: the odds of retention is 5.7 times higher (95% CI 4.4-7.4)in patients admitted during the COVID-19 pandemic compared to pre-pandemic.
+```
+
+## Cox Proportional-Hazards Model (death, discharge, transfer = event)
+## EVENT--Leaving the ER
+```{r}
+## Figure
+hist(COVID$hour_total)
+
+## Treat 'transfer', 'discharge', 'death' as event, 'Obeservation' as censoring.#
+      ## recode variable- event
+ COVID1 = COVID %>%
+   mutate(event = case_when(Outcome %in% c('transfer', 'discharge', 'death') ~ "1",
+                           Outcome %in% c('Observation') ~ "0"),
+         event = as.numeric(event),
+         EPI = factor(EPI),
+         Sex = factor(Sex),
+         System = factor(System),
+         EPI = case_when(EPI == 1 ~ "Pandemic",
+                          EPI == 0 ~ "Pre-pandemic"))
+      ## examine the recoding  
+ table(COVID1$Outcome, COVID1$event)
+ 
+##Modling
+ mod.cox1.unadj = coxph(Surv(hour_total, event) ~ EPI, COVID1)
+ summary(mod.cox1.unadj)
+##Interpretation: Those who were admitted to the ER during pandemic had a 3.9 times higher hazard of retention than pre-pandemic.
+
+ ## Adjusting 
+ mod.cox1 = coxph(Surv(hour_total, event) ~ EPI + Age + Sex + System, COVID1)
+ summary(mod.cox1)
+##Interpretation: Those who admitted to ER during the pandemic had a 4.3  times higher hazard of retention than pre-pandemic.
+ 
+##Compare models
+lrtest(mod.cox1.unadj, mod.cox1) 
+
+###The likelihood ratio test indicates that the model adjusting confounders significantly improves fit compared to the model with just pandemic (p=3.6 * e-08). 
+ ##### ERROR: problem of plot
+##class(COVID$Sex)
+##mod2 = coxph(Surv(hour_total, event) ~ EPI + Age + Sex + System, COVID)
+##summary(mod2)
+##ggadjustedcurves(mod.cox2, data = COVID1, method = "marginal", variable = "EPI")
+
+##KM
+library(ggfortify)
+library(survival)
+fit <- survfit(Surv(hour_total, event) ~ EPI, data = COVID1)
+
+## ggsurvplot (xlab = "Hours")
+ggsurvplot(fit, data = COVID1, risk.table = TRUE, conf.int=TRUE, tables.theme = clean_theme(), xlab = "Hours") 
+fit
+
+
+COVID1$day_total = COVID1$hour_total/24 ## Add day variable
+fit2 <- survfit(Surv(day_total, event) ~ EPI, data = COVID1)
+
+## ggsurvplot (xlab = "Days")
+ggsurvplot(fit2, data = COVID1, risk.table = TRUE, conf.int=TRUE, tables.theme = clean_theme(), xlab = "Days") 
+fit2
+
+## Day < 3
+COVID.D.F = filter(COVID1, day_total < 3)
+fit3 <- survfit(Surv(day_total, event) ~ EPI, data = COVID.D.F)
+## ggsurvplot (xlab = "Days")
+ggsurvplot(fit3, data = COVID.D.F, risk.table = TRUE, conf.int=TRUE, tables.theme = clean_theme(), xlab = "Days") 
+fit3
+survdiff(Surv(day_total, event) ~ EPI,data=COVID.D.F)
+```
+
+## Cox Proportional-Hazards Model (discharge, transfer = event)
+## EVENT--Leaving the ER
+```{r}
+ ## Treat 'transfer', 'discharge' as event.
+  COVID2 = COVID %>%
+    filter(Outcome!= 'death') %>%
+   mutate(event = case_when(Outcome %in% c('transfer', 'discharge') ~ "1",
+                           Outcome %in% c('Observation') ~ "0"),
+         event = as.numeric(event),
+         EPI = factor(EPI),
+         Sex = factor(Sex),
+         System = factor(System))
+       ## examine the recoding  
+ table(COVID2$Outcome, COVID2$event)
+       ## Figure
+
+##Modling
+ mod.cox2.unadj = coxph(Surv(hour_total, event) ~ EPI, COVID2)
+ summary(mod.cox2.unadj)
+
+ ##Interpretation: Those who admitted to ER during the pandemic had a 4.3  times higher hazard of retention than pre-pandemic.
+
+ 1/0.1977
+ 1/0.2682
+ 
+## Adjusting 
+ mod.cox2 = coxph(Surv(hour_total, event) ~ EPI + Age + Sex + System, COVID2)
+ summary(mod.cox2)
+##Interpretation: Those who admitted to ER during the pandemic had a 4.3  times higher hazard of retention than pre-pandemic.
+ 1/0.1810    
+ 1/0.2480
+##Compare models
+lrtest(mod.cox2.unadj, mod.cox2) 
+
+###The likelihood ratio test indicates that the model adjusting confounders significantly improves fit compared to the model with just pandemic (p=1.9 * e-11). 
+```
+
+## Cox Proportional-Hazards Model (Death = event)
+## EVENT--Death
+```{r}
+ ## Treat 'death' as event.
+  COVID3 = COVID %>%
+   mutate(event = case_when(Outcome %in% c('death') ~ "1",
+                           Outcome %in% c('transfer', 'discharge', 'Observation') ~ "0"),
+         event = as.numeric(event),
+         EPI = factor(EPI),
+         Sex = factor(Sex),
+         System = factor(System))
+       ## examine the recoding  
+ table(COVID3$Outcome, COVID3$event)
+       
+ 
+##Modling
+ mod.cox3.unadj = coxph(Surv(hour_total, event) ~ EPI, COVID3)
+ summary(mod.cox3.unadj)
+
+ ##Interpretation: No significant difference was found. Those who admitted to ER during the pandemic had a 1.4  times higher hazard of death than pre-pandemic.
+
+## Adjusting 
+ mod.cox3 = coxph(Surv(hour_total, event) ~ EPI + Age + Sex + System, COVID3)
+ summary(mod.cox3)
+##Interpretation: No significant difference was found. Those who admitted to ER during the pandemic had a 1.5  times higher hazard of death than pre-pandemic.
+ 
+##Compare models
+lrtest(mod.cox3.unadj, mod.cox3) 
+
+###The likelihood ratio test indicates that the model adjusting confounders significantly improves fit compared to the model with just pandemic (p=1.4 * e-8). 
+```
+
+## Multinominal logistic regression 
+```{r}
+##Circulatory & Cardiovascular system as the reference
+mod.mlog = multinom ( System ~ EPI + Age + Sex , data = COVID)
+summary(mod.mlog)
+exp(coef(mod.mlog))
+exp(confint(mod.mlog, level=0.95))
+
+##set Respiratory system disease as the reference
+COVID.SYS = COVID %>%
+  mutate(System = factor(System),
+         System = relevel(System, ref = 'Respiratory system'))
+mod.mlog2 = multinom ( System ~ EPI + Age + Sex , data = COVID.SYS)
+summary(mod.mlog2)
+exp(coef(mod.mlog2))
+exp(confint(mod.mlog2, level=0.95))
+##Interpretation: The odds of being diagnosed with Circulatory & Cardiovascular system diseases relative to Respiratory system disease is 0.67 times lower for pandemic ER admission patients versus pre-pandemic ER admission patients, holding all other variables constant. 
+##Interpretation: The odds of being diagnosed with Muscular & Skeletal System diseases relative to Respiratory system disease is 3.0 times higher for pandemic ER admission patients versus pre-pandemic ER admission patients, holding all other variables constant. 
+##Interpretation: The odds of being diagnosed with Nervous system diseases relative to Respiratory system disease is 1.5 times higher for pandemic ER admission patients versus pre-pandemic ER admission patients, holding all other variables constant. 
+##Interpretation: The odds of being diagnosed with Renal & Urinary system diseases relative to Respiratory system disease is 3.7 times higher for pandemic ER admission patients versus pre-pandemic ER admission patients, holding all other variables constant. 
+##Interpretation: The odds of being diagnosed with Reproductive system diseases relative to Respiratory system disease is 1.9 times higher for pandemic ER admission patients versus pre-pandemic ER admission patients, holding all other variables constant. 
+```
+
